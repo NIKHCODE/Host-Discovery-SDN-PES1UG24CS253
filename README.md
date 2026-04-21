@@ -1,286 +1,397 @@
+# 🌐 Host Discovery Service — SDN Project
 
-# 🔐 Secure Publish-Subscribe Notification Service
-
-A publish-subscribe message broker built from scratch using **Python TCP sockets with SSL/TLS encryption**. A central broker manages topic subscriptions and delivers messages to all registered subscribers in real time — no polling, no external dependencies.
-
-> **Socket Programming Mini Project — PES University, Bengaluru**
+> Automatically detect and maintain a list of hosts in an SDN network using POX Controller and Mininet.
 
 ***
 
-## What Problem Does This Solve?
+## 📋 Problem Statement
 
-In distributed systems, services often need to communicate without knowing about each other. A publisher generating sports scores shouldn't care *who* is listening, and a subscriber watching for weather alerts shouldn't need to keep asking "is there anything new?"
-
-This project implements the **Publish-Subscribe pattern** — a foundational messaging paradigm where:
-- **Publishers** send messages to named *topics*
-- **Subscribers** declare interest in *topics*
-- A **central broker** routes messages between them — they never talk directly
-
-All communication is encrypted with **TLS 1.2+** to prevent eavesdropping on the wire, making it suitable for multi-device LAN setups (e.g., VMware bridged networking lab environments).
+In traditional networks, there is no automatic mechanism to know which hosts are connected, on which port, or with which IP. This project solves that using SDN — every time a new host sends its first packet, the controller detects it via `packet_in`, logs it, and maintains a live host database.
 
 ***
 
-## System Architecture
+## 🎯 Objectives
 
-```mermaid
-graph TB
-    subgraph Clients
-        P1[Publisher A]
-        P2[Publisher B]
-        S1[Subscriber 1]
-        S2[Subscriber 2]
-        S3[Subscriber 3]
-    end
+- ✅ Detect host join events via `packet_in` (TABLE MISS)
+- ✅ Maintain a dynamic host database (MAC, IP, Switch DPID, Port)
+- ✅ Install explicit match-action flow rules reactively
+- ✅ Display `NEW HOST DETECTED` in real-time
+- ✅ Detect host movement across ports
 
-    subgraph Broker["🖥️ Broker (broker.py)"]
-        direction TB
-        TLS[TLS Termination Layer]
-        TM[Topic Manager]
-        subgraph Threads["Thread Pool"]
-            T1[Client Thread 1]
-            T2[Client Thread 2]
-            T3[Client Thread 3]
-        end
-        TLS --> TM
-        TM --> Threads
-    end
+***
 
-    subgraph Certs["📜 Certificates"]
-        CRT[server.crt]
-        KEY[server.key]
-    end
+## 🏗️ Architecture
 
-    P1 -->|TLS pub sports msg| TLS
-    P2 -->|TLS pub weather msg| TLS
-    TLS -->|NOTIFY sports msg| S1
-    TLS -->|NOTIFY sports msg| S2
-    TLS -->|NOTIFY weather msg| S3
-    CRT -.->|verify| P1
-    CRT -.->|verify| S1
-    KEY -.->|private key| TLS
+```
+┌─────────────────────────────────────────┐
+│           APPLICATION LAYER             │
+│         host_discovery.py               │  ← Your custom POX module
+├─────────────────────────────────────────┤
+│            CONTROL LAYER                │
+│    POX Controller (OpenFlow 1.0)        │  ← Centralized control plane
+│    forwarding.l2_learning               │  ← Built-in L2 learning switch
+├─────────────────────────────────────────┤
+│         INFRASTRUCTURE LAYER            │
+│    Open vSwitch (s1) via OpenFlow       │  ← Data plane forwarding
+└─────────────────────────────────────────┘
+         ↑ Southbound API: OpenFlow 1.0 / TCP 6633
 ```
 
 ***
 
-## Message Flow (Sequence Diagram)
+## 🔗 Network Topology
 
-```mermaid
-sequenceDiagram
-    participant Sub as Subscriber
-    participant Broker as Broker
-    participant Pub as Publisher
+```
+         POX Controller (c0)
+               │
+               │ OpenFlow / TCP 6633
+               │
+          ┌────┴────┐
+          │   s1    │  ← OVS Switch (DPID: 1)
+          └┬──┬──┬──┬┘
+           │  │  │  │
+          h1  h2  h3  h4
+       port 1  2   3   4
+```
 
-    Sub->>Broker: TLS Handshake 🔐
-    Broker-->>Sub: Certificate verified ✓
-    Sub->>Broker: sub sports
-    Broker-->>Sub: OK subscribed to sports
+| Host | IP Address | MAC Address       | Port on s1 |
+|------|------------|-------------------|------------|
+| h1   | 10.0.0.1   | 00:00:00:00:00:01 | 1          |
+| h2   | 10.0.0.2   | 00:00:00:00:00:02 | 2          |
+| h3   | 10.0.0.3   | 00:00:00:00:00:03 | 3          |
+| h4   | 10.0.0.4   | 00:00:00:00:00:04 | 4          |
 
-    Pub->>Broker: TLS Handshake 🔐
-    Broker-->>Pub: Certificate verified ✓
-    Pub->>Broker: pub sports Goal! Bengaluru FC 2-1
-    Broker-->>Pub: OK published to sports (1 subscriber)
+***
 
-    Broker->>Sub: NOTIFY sports Goal! Bengaluru FC 2-1
+## ⚙️ How It Works
 
-    Note over Sub,Broker: Subscriber receives message<br/>asynchronously — no polling
+```
+Host sends first packet
+        │
+        ▼
+Switch: no flow rule → TABLE MISS
+        │
+        ▼
+Switch sends packet_in ──► POX Controller
+                                │
+                    ┌───────────▼────────────┐
+                    │  Extract from packet:  │
+                    │  • Source MAC (L2)     │
+                    │  • Source IP  (L3)     │
+                    │  • Switch DPID         │
+                    │  • Ingress Port        │
+                    └───────────┬────────────┘
+                                │
+                    ┌───────────▼────────────┐
+                    │  New MAC?              │
+                    │  → Print NEW HOST      │
+                    │  → Store in host_db    │
+                    │  Already known?        │
+                    │  → Check port change   │
+                    └───────────┬────────────┘
+                                │
+                    ┌───────────▼────────────┐
+                    │  Install Flow Rule     │
+                    │  match: dl_dst = MAC   │
+                    │  action: output→port   │
+                    │  idle_timeout: 30s     │
+                    └────────────────────────┘
+                                │
+                                ▼
+              Future packets forwarded by switch directly
+              (no controller involvement = lower latency)
 ```
 
 ***
 
-## Project Structure
+## 🚀 Setup & Running
 
-```
-pubsub-project/
-├── src/
-│   ├── config.py        # Host, port, SSL cert paths (edit for multi-device)
-│   ├── broker.py        # Central TLS broker server
-│   ├── publisher.py     # TLS publisher client
-│   └── subscriber.py    # TLS subscriber client
-├── certs/
-│   ├── gen_certs.py     # Self-signed certificate generator
-│   ├── server.crt       # TLS certificate (generated)
-│   └── server.key       # TLS private key (generated, broker only)
-├── tests/
-│   ├── test_pubsub.py   # Integration tests (12 tests)
-│   └── benchmark.py     # Performance evaluation
-├── docs/
-│   ├── protocol.md      # Wire protocol specification
-│   └── architecture.md  # System design & component diagram
-├── .gitignore
-└── README.md
-```
+### Prerequisites
 
-***
+- Arch Linux / Ubuntu
+- Python 3.x
+- POX Controller (gar branch) at `~/pox/`
+- Mininet 2.3+
+- Open vSwitch (`ovs-vswitchd` running)
 
-## Wire Protocol
-
-All frames are newline-delimited UTF-8 strings over a TLS TCP socket.
-
-```mermaid
-graph LR
-    subgraph Client-to-Broker
-        C1["sub &lt;topic&gt;"]
-        C2["unsub &lt;topic&gt;"]
-        C3["pub &lt;topic&gt; &lt;message&gt;"]
-        C4["list"]
-        C5["quit"]
-    end
-
-    subgraph Broker-to-Client
-        B1["OK &lt;info&gt;"]
-        B2["ERROR &lt;reason&gt;"]
-        B3["NOTIFY &lt;topic&gt; &lt;message&gt;"]
-        B4["TOPICS &lt;topic:count ...&gt;"]
-    end
-```
-
-| Direction | Frame | Description |
-|---|---|---|
-| Client → Broker | `sub <topic>` | Subscribe to a topic |
-| Client → Broker | `unsub <topic>` | Unsubscribe from a topic |
-| Client → Broker | `pub <topic> <message>` | Publish a message to a topic |
-| Client → Broker | `list` | Request all active topics + subscriber counts |
-| Client → Broker | `quit` | Gracefully disconnect |
-| Broker → Client | `OK <info>` | Acknowledgement |
-| Broker → Client | `ERROR <reason>` | Error response |
-| Broker → Client | `NOTIFY <topic> <message>` | Pushed message (async, no polling) |
-| Broker → Client | `TOPICS <topic:count ...>` | Response to `list` |
-
-***
-
-## Requirements
-
-- Python 3.7+ (tested up to 3.12)
-- `cryptography` library (one-time, for cert generation only)
-- Works on Ubuntu, Windows, and macOS
-
-***
-
-## Setup & Running
-
-### 1. Install dependency (one-time)
+### File Placement
 
 ```bash
-pip install cryptography
-```
-
-### 2. Generate SSL certificates (one-time)
-
-```bash
-python3 certs/gen_certs.py
-```
-
-Creates `certs/server.crt` (shared with clients) and `certs/server.key` (broker only).
-
-***
-
-### Single Machine — 3 Terminals
-
-**Terminal 1 — Start the Broker**
-```bash
-python3 src/broker.py
-```
-
-**Terminal 2 — Start a Subscriber**
-```bash
-python3 src/subscriber.py
->>> sub sports
->>> sub weather
-```
-
-**Terminal 3 — Start a Publisher**
-```bash
-python3 src/publisher.py
->>> pub sports Goal! Bengaluru FC 2-1
->>> pub weather Heavy rain alert tonight
-```
-
-The subscriber in Terminal 2 will instantly receive:
-```
-NOTIFY sports Goal! Bengaluru FC 2-1
-NOTIFY weather Heavy rain alert tonight
+cp host_discovery.py ~/pox/pox/host_discovery.py
 ```
 
 ***
 
-### Multi-Device Setup (LAN / VMware Bridged)
-
-```mermaid
-graph LR
-    subgraph VM1["VM 1 — Broker"]
-        B[broker.py\n192.168.1.5:9000]
-    end
-    subgraph VM2["VM 2 — Publisher"]
-        P[publisher.py]
-    end
-    subgraph VM3["VM 3 — Subscriber"]
-        S[subscriber.py]
-    end
-
-    P -->|TLS :9000| B
-    S -->|TLS :9000| B
-    B -->|NOTIFY| S
-```
-
-1. Run `ip a` on the broker machine — note its LAN IP (e.g. `192.168.1.5`)
-2. Copy `certs/server.crt` to all other machines (same relative path)
-3. Edit `src/config.py` on **all machines**:
-   ```python
-   BROKER_HOST = "192.168.1.5"
-   ```
-4. On the broker machine, allow the port:
-   ```bash
-   sudo ufw allow 9000/tcp
-   ```
-5. Start broker on VM1, then connect from VM2 and VM3
-
-> **VMware note:** Set Network Adapter to **Bridged** mode on all VMs, then run `sudo dhclient` to obtain a LAN IP.
-
-***
-
-## Tests & Benchmarks
-
-### Integration Tests (12 tests)
+## ▶️ Step 0 — Cleanup (Always Run First)
 
 ```bash
-python3 tests/test_pubsub.py
-# Expected: 12/12 tests passed
+sudo mn -c
 ```
 
-### Performance Benchmark
+Clears old Mininet topology, stale OVS bridges, and leftover processes.
+
+***
+
+## ▶️ Step 1 — Start POX Controller (Terminal 1)
 
 ```bash
-python3 tests/benchmark.py                        # 10 clients, 100 msgs (default)
-python3 tests/benchmark.py --clients 20 --messages 200
+cd ~/pox
+python3 pox.py log.level --DEBUG forwarding.l2_learning host_discovery
 ```
 
-Reports: latency (min / mean / median / stdev), throughput (msg/s), concurrent client delivery rate.
+| Part | Meaning |
+|------|---------|
+| `log.level --DEBUG` | Show all events in real-time |
+| `forwarding.l2_learning` | Built-in MAC learning switch module |
+| `host_discovery` | Your custom module — prints NEW HOST DETECTED |
+
+**Wait for:**
+```
+INFO:core:POX 0.7.0 (gar) is up.
+```
+
+> 🔴 Keep this terminal open — all `NEW HOST DETECTED` output appears here.
 
 ***
 
-## Troubleshooting
+## ▶️ Step 2 — Start Mininet (Terminal 2)
 
-| Problem | Fix |
-|---|---|
-| `ModuleNotFoundError: cryptography` | `pip install cryptography` |
-| `SSL certificates not found` | `python3 certs/gen_certs.py` |
-| `Connection refused` | Broker not started, or wrong IP in `config.py` |
-| `Address already in use` | `lsof -i :9000` then `kill <pid>` |
-| Cannot connect across VMs | Set VMware adapter to **Bridged**, run `sudo dhclient` |
-| Port blocked | `sudo ufw allow 9000/tcp` on broker machine |
+```bash
+sudo mn --controller=remote --topo=single,4 --mac
+```
 
-***
+| Part | Meaning |
+|------|---------|
+| `--controller=remote` | Connect to external POX on 127.0.0.1:6633 |
+| `--topo=single,4` | 1 switch + 4 hosts |
+| `--mac` | Clean MACs: 00:00:00:00:00:01 etc. |
 
-## Security Notes
-
-- Uses **TLS 1.2 minimum** — all data on the wire is encrypted
-- Certificates are self-signed (suitable for lab/LAN use)
-- The private key (`server.key`) never leaves the broker machine
-- Clients only need `server.crt` to verify the broker's identity
+**Wait for:**
+```
+mininet>
+```
 
 ***
 
-## Docs
+## 🧪 Scenario 1 — Discover All Hosts (`pingall`)
 
-- [`docs/protocol.md`](docs/protocol.md) — Full wire protocol specification
-- [`docs/architecture.md`](docs/architecture.md) — Component diagram and design decisions
+```bash
+mininet> pingall
+```
+
+Every host sends its first packet → triggers `packet_in` → controller detects each new host.
+
+**Expected POX output (Terminal 1):**
+```
+==================================================
+        NEW HOST DETECTED
+==================================================
+  MAC    : 00:00:00:00:00:01
+  IP     : 10.0.0.1
+  Switch : 1
+  Port   : 1
+==================================================
+
+(repeats for h2, h3, h4)
+```
+
+**Expected Mininet output:**
+```
+*** Results: 0% dropped (12/12 received)
+```
+
+***
+
+## 🧪 Scenario 2 — Ping a Specific Host
+
+```bash
+mininet> h1 ping -c 5 h4
+```
+
+**Other ping variants:**
+```bash
+mininet> h1 ping -c 1 h2        # ping once
+mininet> h2 ping -c 10 h3       # ping 10 times
+mininet> h1 ping -c 5 10.0.0.4  # ping by IP
+mininet> h3 ping -c 3 h1        # h3 to h1
+```
+
+**Expected output:**
+```
+icmp_seq=1 time=15.3 ms   ← first ping (controller involved)
+icmp_seq=2 time=0.18 ms   ← after flow rule installed
+icmp_seq=3 time=0.11 ms
+icmp_seq=4 time=0.10 ms
+icmp_seq=5 time=0.09 ms
+```
+
+> First ping is slower (packet_in round trip). Later pings are sub-millisecond — proves reactive SDN flow installation works.
+
+***
+
+## 🧪 Scenario 3 — Verify Flow Table
+
+```bash
+mininet> sh ovs-ofctl dump-flows s1
+```
+
+**Expected output:**
+```
+cookie=0x0, duration=5.3s, table=0, n_packets=6,
+  dl_dst=00:00:00:00:00:01 actions=output:1
+
+cookie=0x0, duration=5.1s, table=0, n_packets=6,
+  dl_dst=00:00:00:00:00:02 actions=output:2
+```
+
+> `n_packets` counter rising = switch forwarding directly using the flow rule.
+
+***
+
+## 🧪 Scenario 4 — Packet Capture
+
+```bash
+mininet> h1 tcpdump -i h1-eth0 -c 10 &
+mininet> h2 ping -c 5 h1
+```
+
+**Expected tcpdump output:**
+```
+ICMP echo request from 10.0.0.2
+ICMP echo reply  from 10.0.0.1
+(5 request/reply pairs)
+```
+
+***
+
+## 🧪 Scenario 5 — Detect Irregularity (Link Failure)
+
+```bash
+mininet> link s1 h2 down     # disconnect h2
+mininet> pingall              # h2 shows as unreachable (X)
+mininet> link s1 h2 up        # reconnect h2
+mininet> pingall              # back to 0% drop
+```
+
+***
+
+## 🧪 Scenario 6 — Port Statistics (Detect Abnormal Traffic)
+
+```bash
+mininet> sh ovs-ofctl dump-ports s1
+```
+
+Compare per-port counters. A port with abnormally high `rx pkts` signals a flooding host — detectable irregularity.
+
+***
+
+## 📊 Performance Metrics
+
+| Metric | Command | Expected Result |
+|--------|---------|----------------|
+| Reachability | `pingall` | 0% dropped (12/12) |
+| Latency | `h1 ping -c 5 h4` | First ~10ms, rest <1ms |
+| Flow table | `ovs-ofctl dump-flows s1` | 1 rule per host |
+| Packet capture | `tcpdump` | ICMP request/reply visible |
+
+***
+
+## 🗂️ Full Mininet CLI Reference
+
+```bash
+# Network Info
+nodes                              # List all nodes
+net                                # Show all links
+dump                               # Node details (IP, PID, interface)
+links                              # Show links with status
+
+# Connectivity
+pingall                            # Ping every host pair
+pingpair                           # Ping between h1 and h2 only
+h1 ping -c 5 h4                    # h1 pings h4 five times
+h1 ping -c 1 10.0.0.4              # Ping by IP
+
+# Flow Table
+sh ovs-ofctl dump-flows s1         # Show all flow rules
+sh ovs-ofctl dump-ports s1         # Per-port packet counters
+sh ovs-ofctl del-flows s1          # Delete all flow rules
+sh ovs-ofctl show s1               # Switch DPID and ports
+
+# Packet Capture
+h1 tcpdump -i h1-eth0 -c 10 &     # Capture 10 packets on h1
+
+# Link Control
+link s1 h2 down                    # Disconnect h2
+link s1 h2 up                      # Reconnect h2
+
+# Visual Terminals
+xterm h1 h2 h3 h4                  # Open terminal per host
+
+# Exit
+exit                               # Quit Mininet
+```
+
+***
+
+## 🔁 Reset Between Runs
+
+```bash
+mininet> exit
+# Terminal 1: Ctrl+C
+sudo mn -c
+```
+
+Restart from Step 1.
+
+***
+
+## 🐛 Troubleshooting
+
+| Issue | Fix |
+|-------|-----|
+| `Connection refused` on Mininet start | POX not running — start Terminal 1 first |
+| `pingall` shows 100% drop | Controller not connected — check Terminal 1 |
+| `No module named host_discovery` | Move file to `~/pox/pox/host_discovery.py` |
+| `ovs-vswitchd not running` | `sudo systemctl start ovs-vswitchd ovsdb-server` |
+| Old topology exists | Run `sudo mn -c` before starting |
+| `iperf GLIBC error` | Use `iperf3`: `sudo pacman -S iperf3` |
+
+***
+
+## 🧠 Key SDN Concepts
+
+| Term | Meaning |
+|------|---------|
+| **SDN** | Separates control plane (POX) from data plane (OVS) |
+| **OpenFlow** | Protocol for controller-switch communication via TCP 6633 |
+| **packet_in** | Event when switch has no matching flow rule |
+| **TABLE MISS** | Condition triggering `packet_in` to controller |
+| **Reactive Mode** | Flow rules installed on-demand after `packet_in` |
+| **Flow Rule** | `<match, action, priority, timeout>` stored in switch |
+| **DPID** | Unique 64-bit switch identifier |
+| **TCAM** | Switch hardware for fast flow-rule lookup |
+| **Northbound API** | Between controller and your app (host_discovery.py) |
+| **Southbound API** | OpenFlow channel between POX and OVS on TCP 6633 |
+
+***
+
+## 📁 Project Structure
+
+```
+sdn-host-discovery/
+├── README.md
+├── host_discovery.py       ← POX module: packet_in + host_db
+└── screenshots/
+    ├── new_host_detected.png
+    ├── pingall.png
+    └── flow_table.png
+```
+
+***
+
+## 📚 References
+
+- [Mininet](http://mininet.org)
+- [POX Controller](https://github.com/noxrepo/pox)
+- [OpenFlow 1.0 Spec](https://opennetworking.org)
+- [Open vSwitch](https://www.openvswitch.org)
